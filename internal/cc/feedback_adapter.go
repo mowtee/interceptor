@@ -86,13 +86,16 @@ func (f *FeedbackAdapter) OnSent(ts time.Time, header *rtp.Header, size int, att
 	return f.onSentRFC8888(ts, header, size)
 }
 
+// unpackRunLengthChunk reads at most maxStatuses packet statuses from the
+// chunk: the feedback's PacketStatusCount bounds every chunk.
 func (f *FeedbackAdapter) unpackRunLengthChunk(
-	start uint16, refTime time.Time, chunk *rtcp.RunLengthChunk, deltas []*rtcp.RecvDelta,
+	start uint16, refTime time.Time, chunk *rtcp.RunLengthChunk, deltas []*rtcp.RecvDelta, maxStatuses uint16,
 ) (consumedDeltas int, nextRef time.Time, acks []Acknowledgment, err error) {
-	result := make([]Acknowledgment, chunk.RunLength)
+	count := min(chunk.RunLength, maxStatuses)
+	result := make([]Acknowledgment, count)
 	deltaIndex := 0
 
-	end := start + chunk.RunLength
+	end := start + count
 	resultIndex := 0
 	for i := start; i != end; i++ {
 		key := feedbackHistoryKey{
@@ -116,13 +119,19 @@ func (f *FeedbackAdapter) unpackRunLengthChunk(
 	return deltaIndex, refTime, result, nil
 }
 
+// unpackStatusVectorChunk reads at most maxStatuses symbols from the chunk.
+// A status vector always carries 7 or 14 symbols; when the feedback's
+// PacketStatusCount ends inside the last chunk, the remaining symbols are
+// padding, not packet statuses, and must not be looked up: packets still
+// in flight would otherwise be reported as lost.
 func (f *FeedbackAdapter) unpackStatusVectorChunk(
-	start uint16, refTime time.Time, chunk *rtcp.StatusVectorChunk, deltas []*rtcp.RecvDelta,
+	start uint16, refTime time.Time, chunk *rtcp.StatusVectorChunk, deltas []*rtcp.RecvDelta, maxStatuses uint16,
 ) (consumedDeltas int, nextRef time.Time, acks []Acknowledgment, err error) {
-	result := make([]Acknowledgment, len(chunk.SymbolList))
+	symbols := chunk.SymbolList[:min(len(chunk.SymbolList), int(maxStatuses))]
+	result := make([]Acknowledgment, len(symbols))
 	deltaIndex := 0
 	resultIndex := 0
-	for i, symbol := range chunk.SymbolList {
+	for i, symbol := range symbols {
 		key := feedbackHistoryKey{
 			ssrc:           0,
 			sequenceNumber: start + uint16(i), //nolint:gosec // G115
@@ -156,11 +165,17 @@ func (f *FeedbackAdapter) OnTransportCCFeedback(
 	index := feedback.BaseSequenceNumber
 	refTime := time.Time{}.Add(time.Duration(feedback.ReferenceTime) * 64 * time.Millisecond)
 	recvDeltas := feedback.RecvDeltas
+	// PacketStatusCount is the number of packets the feedback reports on;
+	// symbols beyond it are padding.
+	remaining := feedback.PacketStatusCount
 
 	for _, chunk := range feedback.PacketChunks {
+		if remaining == 0 {
+			break
+		}
 		switch chunk := chunk.(type) {
 		case *rtcp.RunLengthChunk:
-			n, nextRefTime, acks, err := f.unpackRunLengthChunk(index, refTime, chunk, recvDeltas)
+			n, nextRefTime, acks, err := f.unpackRunLengthChunk(index, refTime, chunk, recvDeltas, remaining)
 			if err != nil {
 				return nil, err
 			}
@@ -168,8 +183,9 @@ func (f *FeedbackAdapter) OnTransportCCFeedback(
 			result = append(result, acks...)
 			recvDeltas = recvDeltas[n:]
 			index = uint16(int(index) + len(acks)) //nolint:gosec // G115
+			remaining -= uint16(len(acks))         //nolint:gosec // G115
 		case *rtcp.StatusVectorChunk:
-			n, nextRefTime, acks, err := f.unpackStatusVectorChunk(index, refTime, chunk, recvDeltas)
+			n, nextRefTime, acks, err := f.unpackStatusVectorChunk(index, refTime, chunk, recvDeltas, remaining)
 			if err != nil {
 				return nil, err
 			}
@@ -177,6 +193,7 @@ func (f *FeedbackAdapter) OnTransportCCFeedback(
 			result = append(result, acks...)
 			recvDeltas = recvDeltas[n:]
 			index = uint16(int(index) + len(acks)) //nolint:gosec // G115
+			remaining -= uint16(len(acks))         //nolint:gosec // G115
 		default:
 			return nil, errInvalidFeedback
 		}

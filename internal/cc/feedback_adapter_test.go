@@ -5,6 +5,7 @@ package cc
 
 import (
 	"fmt"
+	"math"
 	"testing"
 	"time"
 
@@ -224,7 +225,7 @@ func TestUnpackRunLengthChunk(t *testing.T) {
 				assert.NoError(t, fa.OnSent(time.Time{}, h, 0, attributes))
 			}
 
-			n, refTime, acks, err := fa.unpackRunLengthChunk(tc.start, time.Time{}, &tc.chunk, tc.deltas)
+			n, refTime, acks, err := fa.unpackRunLengthChunk(tc.start, time.Time{}, &tc.chunk, tc.deltas, math.MaxUint16)
 			assert.NoError(t, err)
 			assert.Len(t, acks, len(tc.acks))
 			assert.Equal(t, tc.n, n)
@@ -407,7 +408,7 @@ func TestUnpackStatusVectorChunk(t *testing.T) {
 				assert.NoError(t, fa.OnSent(time.Time{}, h, 0, attributes))
 			}
 
-			n, refTime, acks, err := fa.unpackStatusVectorChunk(tc.start, time.Time{}, &tc.chunk, tc.deltas)
+			n, refTime, acks, err := fa.unpackStatusVectorChunk(tc.start, time.Time{}, &tc.chunk, tc.deltas, math.MaxUint16)
 			assert.NoError(t, err)
 			assert.Len(t, acks, len(tc.acks))
 			assert.Equal(t, tc.n, n)
@@ -419,6 +420,66 @@ func TestUnpackStatusVectorChunk(t *testing.T) {
 			assert.Equal(t, tc.acks, acks)
 		})
 	}
+}
+
+func TestUnpackChunksStopAtMaxStatuses(t *testing.T) {
+	attributes := make(interceptor.Attributes)
+	attributes.Set(TwccExtensionAttributesKey, hdrExtID)
+	received := []*rtcp.RecvDelta{
+		{Type: rtcp.TypeTCCPacketReceivedSmallDelta, Delta: 4},
+		{Type: rtcp.TypeTCCPacketReceivedSmallDelta, Delta: 4},
+		{Type: rtcp.TypeTCCPacketReceivedSmallDelta, Delta: 4},
+		{Type: rtcp.TypeTCCPacketReceivedSmallDelta, Delta: 4},
+		{Type: rtcp.TypeTCCPacketReceivedSmallDelta, Delta: 4},
+	}
+
+	t.Run("statusVectorChunk", func(t *testing.T) {
+		fa := NewFeedbackAdapter()
+		for i := range uint16(7) {
+			pkt := getPacketWithTransportCCExt(t, i)
+			assert.NoError(t, fa.OnSent(time.Time{}, &pkt.Header, 0, attributes))
+		}
+		// Two statuses, then five padding symbols covering packets 2..6,
+		// which are in the history (still in flight).
+		chunk := &rtcp.StatusVectorChunk{
+			Type:       rtcp.TypeTCCStatusVectorChunk,
+			SymbolSize: rtcp.TypeTCCSymbolSizeTwoBit,
+			SymbolList: []uint16{
+				rtcp.TypeTCCPacketReceivedSmallDelta,
+				rtcp.TypeTCCPacketReceivedSmallDelta,
+				rtcp.TypeTCCPacketNotReceived,
+				rtcp.TypeTCCPacketNotReceived,
+				rtcp.TypeTCCPacketNotReceived,
+				rtcp.TypeTCCPacketNotReceived,
+				rtcp.TypeTCCPacketNotReceived,
+			},
+		}
+		n, _, acks, err := fa.unpackStatusVectorChunk(0, time.Time{}, chunk, received[:2], 2)
+		assert.NoError(t, err)
+		assert.Equal(t, 2, n)
+		assert.Len(t, acks, 2)
+		for i, a := range acks {
+			assert.Equal(t, uint16(i), a.SequenceNumber) //nolint:gosec // G115
+			assert.False(t, a.Arrival.IsZero(), "padding must not turn into a lost packet")
+		}
+	})
+
+	t.Run("runLengthChunk", func(t *testing.T) {
+		fa := NewFeedbackAdapter()
+		for i := range uint16(5) {
+			pkt := getPacketWithTransportCCExt(t, i)
+			assert.NoError(t, fa.OnSent(time.Time{}, &pkt.Header, 0, attributes))
+		}
+		chunk := &rtcp.RunLengthChunk{
+			Type:               rtcp.TypeTCCRunLengthChunk,
+			PacketStatusSymbol: rtcp.TypeTCCPacketReceivedSmallDelta,
+			RunLength:          5,
+		}
+		n, _, acks, err := fa.unpackRunLengthChunk(0, time.Time{}, chunk, received, 3)
+		assert.NoError(t, err)
+		assert.Equal(t, 3, n)
+		assert.Len(t, acks, 3)
+	})
 }
 
 func getPacketWithTransportCCExt(t *testing.T, sequenceNumber uint16) *rtp.Packet {
@@ -671,7 +732,7 @@ func TestFeedbackAdapterTWCC(t *testing.T) {
 		assert.NoError(t, err)
 
 		assert.NotEmpty(t, results)
-		assert.Len(t, results, 7)
+		assert.Len(t, results, 2)
 		assert.Contains(t, results, Acknowledgment{
 			SequenceNumber: 65535,
 			Size:           pkt65535.Header.MarshalSize() + 1200,
@@ -739,21 +800,13 @@ func TestFeedbackAdapterTWCC(t *testing.T) {
 			},
 		})
 		assert.NoError(t, err)
-		assert.Len(t, results, 7)
+		assert.Len(t, results, 3)
 		for i := range uint16(3) {
 			assert.Contains(t, results, Acknowledgment{
 				SequenceNumber: i,
 				Size:           headers[i].MarshalSize() + 1200,
 				Departure:      t0,
 				Arrival:        t0.Add(time.Duration((i + 1)) * 4 * time.Microsecond),
-			})
-		}
-		for i := uint16(3); i < 7; i++ {
-			assert.Contains(t, results, Acknowledgment{
-				SequenceNumber: i,
-				Size:           headers[i].MarshalSize() + 1200,
-				Departure:      t0,
-				Arrival:        time.Time{},
 			})
 		}
 	})
@@ -858,7 +911,7 @@ func TestFeedbackAdapterTWCC(t *testing.T) {
 		})
 
 		assert.NoError(t, err)
-		assert.Len(t, packets, 14)
+		assert.Len(t, packets, 3)
 	})
 
 	t.Run("mixedRunLengthAndStatusVector", func(t *testing.T) {
@@ -929,6 +982,56 @@ func TestFeedbackAdapterTWCC(t *testing.T) {
 		})
 		assert.NoError(t, err)
 		assert.Len(t, packets, 10)
+	})
+
+	t.Run("ignoresChunksBeyondPacketStatusCount", func(t *testing.T) {
+		t0 := time.Time{}
+		adapter := NewFeedbackAdapter()
+		for i := range uint16(10) {
+			pkt := getPacketWithTransportCCExt(t, i)
+			assert.NoError(
+				t,
+				adapter.OnSent(t0, &pkt.Header, 1200, interceptor.Attributes{TwccExtensionAttributesKey: hdrExtID}),
+			)
+		}
+
+		// The count ends with the run-length chunk; the trailing status
+		// vector covers packets 3..9, all in the history, and must be
+		// ignored entirely.
+		results, err := adapter.OnTransportCCFeedback(t0, &rtcp.TransportLayerCC{
+			BaseSequenceNumber: 0,
+			PacketStatusCount:  3,
+			PacketChunks: []rtcp.PacketStatusChunk{
+				&rtcp.RunLengthChunk{
+					Type:               rtcp.TypeTCCRunLengthChunk,
+					PacketStatusSymbol: rtcp.TypeTCCPacketReceivedSmallDelta,
+					RunLength:          3,
+				},
+				&rtcp.StatusVectorChunk{
+					Type:       rtcp.TypeTCCStatusVectorChunk,
+					SymbolSize: rtcp.TypeTCCSymbolSizeTwoBit,
+					SymbolList: []uint16{
+						rtcp.TypeTCCPacketNotReceived,
+						rtcp.TypeTCCPacketNotReceived,
+						rtcp.TypeTCCPacketNotReceived,
+						rtcp.TypeTCCPacketNotReceived,
+						rtcp.TypeTCCPacketNotReceived,
+						rtcp.TypeTCCPacketNotReceived,
+						rtcp.TypeTCCPacketNotReceived,
+					},
+				},
+			},
+			RecvDeltas: []*rtcp.RecvDelta{
+				{Type: rtcp.TypeTCCPacketReceivedSmallDelta, Delta: 4},
+				{Type: rtcp.TypeTCCPacketReceivedSmallDelta, Delta: 4},
+				{Type: rtcp.TypeTCCPacketReceivedSmallDelta, Delta: 4},
+			},
+		})
+		assert.NoError(t, err)
+		assert.Len(t, results, 3)
+		for _, r := range results {
+			assert.False(t, r.Arrival.IsZero(), "packet %d must not be reported lost", r.SequenceNumber)
+		}
 	})
 
 	t.Run("doesNotcrashOnInvalidTWCCPacket", func(t *testing.T) {
