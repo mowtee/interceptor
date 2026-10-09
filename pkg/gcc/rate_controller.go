@@ -22,6 +22,8 @@ type rateController struct {
 
 	dsWriter func(DelayStats)
 
+	dbg *dbgState
+
 	lock               sync.Mutex
 	init               bool
 	delayStats         DelayStats
@@ -94,6 +96,15 @@ func (c *rateController) onDelayStats(ds DelayStats) {
 	}
 	c.delayStats = ds
 	c.delayStats.State = c.delayStats.State.transition(ds.Usage)
+	if c.dbg != nil && (c.dbg.active() || c.delayStats.State == stateDecrease) {
+		c.lock.Lock()
+		dbg(c.dbg, "gcc delay",
+			"meas", ds.Measurement, "est", ds.Estimate, "thr", ds.Threshold,
+			"recvDelta", ds.LastReceiveDelta, "usage", ds.Usage.String(),
+			"state", c.delayStats.State.String(),
+			"target", c.target, "received", c.latestReceivedRate)
+		c.lock.Unlock()
+	}
 
 	if c.delayStats.State == stateHold {
 		return
@@ -119,7 +130,11 @@ func (c *rateController) onDelayStats(ds DelayStats) {
 		}
 
 	case stateDecrease:
+		before := c.target
 		c.target = clampInt(c.decrease(), c.minBitrate, c.maxBitrate)
+		if c.dbg != nil {
+			dbg(c.dbg, "gcc decrease", "before", before, "after", c.target, "received", c.latestReceivedRate)
+		}
 		next = DelayStats{
 			Measurement:      c.delayStats.Measurement,
 			Estimate:         c.delayStats.Estimate,

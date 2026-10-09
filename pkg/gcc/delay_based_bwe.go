@@ -4,6 +4,7 @@
 package gcc
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -27,6 +28,7 @@ type DelayStats struct {
 type now func() time.Time
 
 type delayController struct {
+	dbg         *dbgState
 	ackPipe     chan<- []cc.Acknowledgment
 	ackRatePipe chan<- []cc.Acknowledgment
 
@@ -71,6 +73,9 @@ func newDelayController(delayConfig delayControllerConfig, loggerFactory logging
 		},
 	)
 	delayController.rateController = rateController
+	dbgS := &dbgState{id: fmt.Sprintf("%p", delayController)}
+	delayController.dbg = dbgS
+	rateController.dbg = dbgS
 	trendline := newTrendlineEstimator(rateController.onDelayStats)
 	arrivalGroupAccumulator := newArrivalGroupAccumulator()
 
@@ -79,11 +84,19 @@ func newDelayController(delayConfig delayControllerConfig, loggerFactory logging
 	delayController.wg.Add(2)
 	go func() {
 		defer delayController.wg.Done()
-		arrivalGroupAccumulator.run(ackPipe, trendline.onArrivalGroup)
+		arrivalGroupAccumulator.run(ackPipe, func(ag arrivalGroup) {
+			dbgS.group(ag)
+			trendline.onArrivalGroup(ag)
+		})
 	}()
 	go func() {
 		defer delayController.wg.Done()
-		rc.run(ackRatePipe, rateController.onReceivedRate)
+		rc.run(ackRatePipe, func(rate int) {
+			if dbgS.active() {
+				dbg(dbgS, "gcc rate", "rate", rate)
+			}
+			rateController.onReceivedRate(rate)
+		})
 	}()
 
 	return delayController
@@ -94,6 +107,9 @@ func (d *delayController) onUpdate(f func(DelayStats)) {
 }
 
 func (d *delayController) updateDelayEstimate(acks []cc.Acknowledgment) {
+	if len(acks) > 0 {
+		d.dbg.mark()
+	}
 	d.ackPipe <- acks
 	d.ackRatePipe <- acks
 }
