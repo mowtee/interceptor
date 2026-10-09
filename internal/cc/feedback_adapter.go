@@ -6,6 +6,8 @@ package cc
 import (
 	"container/list"
 	"errors"
+	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -60,6 +62,10 @@ func (f *FeedbackAdapter) onSentTWCC(ts time.Time, extID uint8, header *rtp.Head
 		return errMissingTWCCExtension
 	}
 
+	if sonaTrace {
+		_, _ = fmt.Fprintf(os.Stderr, "{\"msg\":\"twcc sent\",\"fa\":\"%p\",\"tseq\":%d,\"ssrc\":%d,\"seq\":%d,\"size\":%d,\"wall\":%d}\n",
+			f, tccExt.TransportSequence, header.SSRC, header.SequenceNumber, size, ts.UnixNano())
+	}
 	f.lock.Lock()
 	defer f.lock.Unlock()
 	f.history.add(Acknowledgment{
@@ -198,9 +204,20 @@ func (f *FeedbackAdapter) OnTransportCCFeedback(
 			return nil, errInvalidFeedback
 		}
 	}
+	if sonaTrace {
+		for _, ack := range result {
+			if !ack.Arrival.IsZero() {
+				_, _ = fmt.Fprintf(os.Stderr, "{\"msg\":\"twcc ack\",\"fa\":\"%p\",\"tseq\":%d,\"arr\":%d,\"fb\":%d}\n",
+					f, ack.SequenceNumber, ack.Arrival.Sub(time.Time{}).Nanoseconds(), feedback.FbPktCount)
+			}
+		}
+	}
 
 	return result, nil
 }
+
+// sonaTrace enables per-packet TWCC traces (debug branch only).
+var sonaTrace = os.Getenv("SONA_GCC_TRACE") == "1"
 
 // OnRFC8888Feedback converts incoming Congestion Control Feedback RTCP packet
 // to Acknowledgments.
