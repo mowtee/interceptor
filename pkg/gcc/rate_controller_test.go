@@ -28,11 +28,12 @@ func TestRateControllerRun(t *testing.T) {
 			initialBitrate: 100_000,
 			usage:          []usage{usageNormal, usageNormal},
 			expected: []DelayStats{{
-				Usage:         usageNormal,
-				State:         stateIncrease,
-				TargetBitrate: 108_000,
-				Estimate:      0,
-				Threshold:     0,
+				Usage:           usageNormal,
+				State:           stateIncrease,
+				TargetBitrate:   108_000,
+				ReceivedBitrate: 100_000,
+				Estimate:        0,
+				Threshold:       0,
 			}},
 		},
 	}
