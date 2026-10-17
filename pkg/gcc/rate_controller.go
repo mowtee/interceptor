@@ -116,6 +116,7 @@ func (c *rateController) onDelayStats(ds DelayStats) {
 			Usage:            c.delayStats.Usage,
 			State:            c.delayStats.State,
 			TargetBitrate:    c.target,
+			ReceivedBitrate:  c.latestReceivedRate,
 		}
 
 	case stateDecrease:
@@ -128,6 +129,7 @@ func (c *rateController) onDelayStats(ds DelayStats) {
 			Usage:            c.delayStats.Usage,
 			State:            c.delayStats.State,
 			TargetBitrate:    c.target,
+			ReceivedBitrate:  c.latestReceivedRate,
 		}
 	}
 

@@ -22,6 +22,9 @@ type DelayStats struct {
 	Usage         usage
 	State         state
 	TargetBitrate int
+	// ReceivedBitrate is the acknowledged bitrate the controller last
+	// based an increase limit or a decrease on.
+	ReceivedBitrate int
 }
 
 type now func() time.Time
