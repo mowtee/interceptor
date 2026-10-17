@@ -15,6 +15,7 @@ import (
 	"github.com/pion/rtp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"time"
 )
 
 // mockTWCCResponder is a RTPWriter that writes
@@ -145,5 +146,43 @@ func BenchmarkSendSideBWE_WriteRTCP(b *testing.B) {
 
 			require.NoError(b, bwe.Close())
 		})
+	}
+}
+
+// A packet under the stream's RTX SSRC — a NACK responder's resend written
+// upstream of the estimator — is paced like the media, not dropped as an
+// unknown SSRC.
+func TestSendSideBWE_PacesTheRTXSSRC(t *testing.T) {
+	bwe, err := NewSendSideBWE()
+	require.NoError(t, err)
+	defer func() { require.NoError(t, bwe.Close()) }()
+	streamInfo := &interceptor.StreamInfo{
+		SSRC:                1,
+		SSRCRetransmission:  2,
+		RTPHeaderExtensions: []interceptor.RTPHeaderExtension{{URI: transportCCURI, ID: 1}},
+	}
+	seen := make(chan uint32, 4)
+	rtpWriter := bwe.AddStream(streamInfo, interceptor.RTPWriterFunc(
+		func(header *rtp.Header, payload []byte, _ interceptor.Attributes) (int, error) {
+			seen <- header.SSRC
+
+			return len(payload), nil
+		},
+	))
+	twccWriter := twcc.HeaderExtensionInterceptor{}
+	rtpWriter = twccWriter.BindLocalStream(streamInfo, rtpWriter)
+	for _, ssrc := range []uint32{1, 2} {
+		_, err = rtpWriter.Write(&rtp.Header{SSRC: ssrc, Extensions: []rtp.Extension{}}, make([]byte, 100), nil)
+		require.NoError(t, err)
+	}
+	got := map[uint32]bool{}
+	deadline := time.After(2 * time.Second)
+	for len(got) < 2 {
+		select {
+		case ssrc := <-seen:
+			got[ssrc] = true
+		case <-deadline:
+			t.Fatalf("the pacer forwarded only %v", got)
+		}
 	}
 }

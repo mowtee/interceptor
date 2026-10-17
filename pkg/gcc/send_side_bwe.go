@@ -160,7 +160,7 @@ func (e *SendSideBWE) AddStream(info *interceptor.StreamInfo, writer interceptor
 		}
 	}
 
-	e.pacer.AddStream(info.SSRC, interceptor.RTPWriterFunc(
+	paced := interceptor.RTPWriterFunc(
 		func(header *rtp.Header, payload []byte, attributes interceptor.Attributes) (int, error) {
 			if hdrExtID != 0 {
 				if attributes == nil {
@@ -174,7 +174,17 @@ func (e *SendSideBWE) AddStream(info *interceptor.StreamInfo, writer interceptor
 
 			return writer.Write(header, payload, attributes)
 		},
-	))
+	)
+	e.pacer.AddStream(info.SSRC, paced)
+	// The stream's RTX SSRC is paced and stamped the same way: a NACK
+	// responder upstream of this interceptor writes its resends under it,
+	// and a pacer that knew only the media SSRC dropped them ("no writer
+	// found for ssrc") — which forced the responder downstream, where its
+	// resends reused the original packet's transport-wide sequence number
+	// and the feedback for a resend read as a 450 ms delay of the original.
+	if info.SSRCRetransmission != 0 {
+		e.pacer.AddStream(info.SSRCRetransmission, paced)
+	}
 
 	return e.pacer
 }
