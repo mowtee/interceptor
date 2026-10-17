@@ -76,3 +76,22 @@ func TestRateControllerRun(t *testing.T) {
 		})
 	}
 }
+
+// libwebrtc's increase limit: an increase never takes the target above
+// 1.5 × the received rate + 10 kbps, and a target already above that limit
+// holds there instead of growing — the old rule stopped limiting once the
+// target had passed the limit.
+func TestRateControllerIncreaseIsLimitedByTheReceivedRate(t *testing.T) {
+	c := &rateController{target: 2_000_000, latestReceivedRate: 700_000, minBitrate: 100_000, maxBitrate: 50_000_000}
+	limit := int(1.5*700_000) + 10_000
+	// Above the limit: hold, do not grow, do not drop.
+	assert.Equal(t, 2_000_000, c.limitIncrease(2_160_000))
+	// Below the limit: grow up to it.
+	c.target = 900_000
+	assert.Equal(t, 972_000, c.limitIncrease(972_000))
+	assert.Equal(t, limit, c.limitIncrease(1_200_000))
+	// Never lower the target on an increase step.
+	c.target = 1_100_000
+	assert.Equal(t, 1_100_000, c.limitIncrease(1_050_000))
+	assert.Equal(t, 1_100_000, c.limitIncrease(1_188_000), "already above the limit: held")
+}

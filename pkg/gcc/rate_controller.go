@@ -149,23 +149,36 @@ func (c *rateController) increase(now time.Time) int {
 		increase := int(math.Max(1000.0, alpha*expectedPacketSizeBits))
 		c.lastUpdate = now
 
-		return int(math.Min(float64(c.target+increase), 1.5*float64(c.latestReceivedRate)))
+		return c.limitIncrease(c.target + increase)
 	}
 	eta := math.Pow(1.08, math.Min(float64(now.Sub(c.lastUpdate).Milliseconds())/1000, 1.0))
 	c.lastUpdate = now
 
-	rate := int(eta * float64(c.target))
+	return c.limitIncrease(int(eta * float64(c.target)))
+}
 
-	// maximum increase to 1.5 * received rate
-	received := int(1.5 * float64(c.latestReceivedRate))
-	if rate > received && received > c.target {
-		return received
-	}
-
+// limitIncrease applies libwebrtc's bound on an increase (AimdRateControl::
+// ChangeBitrate): a new target above 1.5 × the received rate + 10 kbps is
+// held at the current target or that limit, whichever is higher — the
+// limit only limits increases, it never lowers the target, and it keeps
+// limiting once the target is above it. The previous rule capped only
+// while the target was still below the limit (`received > c.target`), so a
+// target that got above 1.5 × received once — a stale received rate right
+// after a capacity drop — kept growing by 8 %/s with nothing delivered to
+// justify it (sotto, 800 kbit/s step: 720 kbit/s → 2.8 Mbit/s in six
+// seconds while forwarding ~700 kbit/s), and the SFU upswitched into the
+// cut on that number.
+func (c *rateController) limitIncrease(rate int) int {
 	if rate < c.target {
 		return c.target
 	}
-
+	limit := int(1.5*float64(c.latestReceivedRate)) + 10_000
+	if rate > limit {
+		if c.target > limit {
+			return c.target
+		}
+		return limit
+	}
 	return rate
 }
 
