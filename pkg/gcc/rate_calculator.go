@@ -57,7 +57,19 @@ func (c *rateCalculator) run(in <-chan []cc.Acknowledgment, onRateUpdate func(in
 
 				continue
 			}
+			// Bytes per window, as libwebrtc's acknowledged-bitrate
+			// estimator measures it — not per the span the kept acks
+			// happen to cover: after a gap, a burst of acks (a bottleneck
+			// queue draining after a capacity drop) spans a few
+			// milliseconds and read as megabits per second (sotto,
+			// 800 kbit/s step: "received" 1.35 Mbit/s on an 800 kbit/s
+			// link, and the increase limit at 1.5× of that). Until the
+			// history spans a window the span is used, floored at half a
+			// window so a start-up burst cannot inflate it either.
 			dt := next.Arrival.Sub(history[0].Arrival)
+			if dt < c.window {
+				dt = max(dt, c.window/2)
+			}
 			bits := 8 * sum
 			rate := int(float64(bits) / dt.Seconds())
 			onRateUpdate(rate)

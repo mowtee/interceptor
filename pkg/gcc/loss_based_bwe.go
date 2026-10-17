@@ -17,8 +17,14 @@ const (
 	// https://datatracker.ietf.org/doc/html/draft-ietf-rmcat-gcc-02#section-6
 
 	increaseLossThreshold = 0.02
-	increaseTimeThreshold = 200 * time.Millisecond
-	increaseFactor        = 1.05
+	// libwebrtc (SendSideBandwidthEstimation::UpdateEstimate, kBweIncreaseInterval):
+	// with no loss the estimate grows 8 % at most once per second. At 5 %
+	// per 200 ms it grew 28 %/s — ×2.9 in four seconds on nothing delivered
+	// (sotto, 800 kbit/s step: 514 kbit/s → 1.5 Mbit/s), far ahead of the
+	// delay controller's climb, and an SFU allocating on the minimum of the
+	// two upswitched into the cut on the loss controller's number.
+	increaseTimeThreshold = time.Second
+	increaseFactor        = 1.08
 
 	decreaseLossThreshold = 0.1
 	decreaseTimeThreshold = 200 * time.Millisecond
