@@ -81,6 +81,15 @@ func (c *rateController) onReceivedRate(rate int) {
 	c.latestReceivedRate = rate
 }
 
+// rtt is the latest round-trip time from the transport feedback (0 until
+// the first).
+func (c *rateController) rtt() time.Duration {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	return c.latestRTT
+}
+
 func (c *rateController) updateRTT(rtt time.Duration) {
 	c.lock.Lock()
 	defer c.lock.Unlock()

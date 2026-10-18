@@ -341,6 +341,7 @@ func (e *SendSideBWE) GetStats() map[string]any {
 		"averageLoss":        e.latestStats.AverageLoss,
 		"delayTargetBitrate": e.latestStats.DelayStats.TargetBitrate,
 		"receivedBitrate":    e.latestStats.DelayStats.ReceivedBitrate,
+		"rtt":                e.delayController.rtt(),
 		"delayMeasurement":   float64(e.latestStats.Measurement.Microseconds()) / 1000.0,
 		"delayEstimate":      float64(e.latestStats.Estimate.Microseconds()) / 1000.0,
 		"delayThreshold":     float64(e.latestStats.Threshold.Microseconds()) / 1000.0,

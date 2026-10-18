@@ -292,3 +292,14 @@ func TestSendSideBWE_FreshStatsAreBenign(t *testing.T) {
 	assert.Equal(t, "normal", st["usage"])
 	assert.Equal(t, "increase", st["state"])
 }
+
+// GetStats carries the round-trip time from the transport feedback (0
+// before the first), for callers that pace their own reactions by it.
+func TestSendSideBWE_StatsCarryTheRTT(t *testing.T) {
+	bwe, err := NewSendSideBWE()
+	require.NoError(t, err)
+	defer func() { require.NoError(t, bwe.Close()) }()
+	assert.Equal(t, time.Duration(0), bwe.GetStats()["rtt"])
+	bwe.delayController.updateRTT(42 * time.Millisecond)
+	assert.Equal(t, 42*time.Millisecond, bwe.GetStats()["rtt"])
+}
