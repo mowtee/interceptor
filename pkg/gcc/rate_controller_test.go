@@ -114,3 +114,12 @@ func TestRateControllerSetEstimateReplacesTheTarget(t *testing.T) {
 	c.setEstimate(10)
 	assert.Equal(t, 100_000, c.target)
 }
+
+// Before the first throughput measurement the increase limit is taken
+// from the initial bitrate, as libwebrtc seeds it: a fresh controller
+// grows (it is not frozen at 1.5 × 0 + 10 kbps).
+func TestRateControllerGrowsBeforeTheFirstMeasurement(t *testing.T) {
+	c := newRateController(time.Now, 1_000_000, 100_000, 50_000_000, func(DelayStats) {})
+	assert.Equal(t, 1_000_000, c.latestReceivedRate)
+	assert.Equal(t, 1_080_000, c.limitIncrease(1_080_000))
+}

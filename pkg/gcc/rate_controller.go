@@ -65,8 +65,13 @@ func newRateController(
 		lastUpdate:           time.Time{},
 		lastState:            stateIncrease,
 		latestRTT:            0,
-		latestReceivedRate:   0,
-		latestDecreaseRate:   &exponentialMovingAverage{},
+		// libwebrtc seeds its throughput memory with the initial bitrate
+		// (AimdRateControl: latest_estimated_throughput_(current_bitrate_)),
+		// so the increase limit allows growth before the first
+		// measurement; seeded with 0 it froze a fresh target at
+		// 1.5 × 0 + 10 kbps until the rate calculator reported.
+		latestReceivedRate: initialTargetBitrate,
+		latestDecreaseRate: &exponentialMovingAverage{},
 	}
 }
 
