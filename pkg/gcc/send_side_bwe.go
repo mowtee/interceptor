@@ -186,7 +186,7 @@ func (e *SendSideBWE) AddStream(info *interceptor.StreamInfo, writer interceptor
 					attributes = make(interceptor.Attributes)
 				}
 				seq := uint16(e.twccSeq.Add(1) - 1) //nolint:gosec // G115
-				e.probeSent(seq, header.MarshalSize()+len(payload))
+				e.probeSent(seq, header.MarshalSize()+len(payload)+int(header.PaddingSize))
 				ext, err := (&rtp.TransportCCExtension{TransportSequence: seq}).Marshal()
 				if err != nil {
 					return 0, err
@@ -196,7 +196,9 @@ func (e *SendSideBWE) AddStream(info *interceptor.StreamInfo, writer interceptor
 				}
 				attributes.Set(cc.TwccExtensionAttributesKey, hdrExtID)
 			}
-			if err := e.feedbackAdapter.OnSent(time.Now(), header, len(payload), attributes); err != nil {
+			// Padding is on the wire too: a padding-only probe packet is
+			// 255 bytes the path carried, not zero.
+			if err := e.feedbackAdapter.OnSent(time.Now(), header, len(payload)+int(header.PaddingSize), attributes); err != nil {
 				return 0, err
 			}
 
