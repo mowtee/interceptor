@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/pion/interceptor"
+	"github.com/pion/interceptor/internal/cc"
 	"github.com/pion/logging"
 	"github.com/pion/rtp"
 	"github.com/stretchr/testify/assert"
@@ -85,4 +86,41 @@ func TestLeakyBucketPacerDefaultsToVideo(t *testing.T) {
 	assert.Equal(t, PacerPriorityVideo, pacer.ssrcToPriority[7])
 	pacer.AddStreamWithPriority(8, nil, PacerPriority(99))
 	assert.Equal(t, PacerPriorityVideo, pacer.ssrcToPriority[8], "an out-of-range priority is video")
+}
+
+// A probe packet (the probe attribute) leaves on the next tick whatever
+// the budget: at a pacing rate that lets one video packet through in
+// ~60 ms, ten probe packets queued behind six video packets are all out
+// within two ticks.
+func TestLeakyBucketPacerSendsProbesOutsideTheBudget(t *testing.T) {
+	pacer := newLeakyBucketPacer(160_000, logging.NewDefaultLoggerFactory())
+	defer func() { require.NoError(t, pacer.Close()) }()
+	var mu sync.Mutex
+	probes, video := 0, 0
+	pacer.AddStream(1, interceptor.RTPWriterFunc(func(_ *rtp.Header, payload []byte, a interceptor.Attributes) (int, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if isProbe, _ := a.Get(cc.ProbePacketAttributesKey).(bool); isProbe {
+			probes++
+		} else {
+			video++
+		}
+
+		return len(payload), nil
+	}))
+	for i := range 6 {
+		_, err := pacer.Write(&rtp.Header{SSRC: 1, SequenceNumber: uint16(i)}, make([]byte, 1000), nil) //nolint:gosec
+		require.NoError(t, err)
+	}
+	for i := range 10 {
+		attrs := interceptor.Attributes{}
+		attrs.Set(cc.ProbePacketAttributesKey, true)
+		_, err := pacer.Write(&rtp.Header{SSRC: 1, SequenceNumber: uint16(100 + i), Padding: true, PaddingSize: 255}, nil, attrs) //nolint:gosec
+		require.NoError(t, err)
+	}
+	time.Sleep(12 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, 10, probes, "every probe packet out within two ticks")
+	assert.Less(t, video, 6, "the video still waits for its budget")
 }

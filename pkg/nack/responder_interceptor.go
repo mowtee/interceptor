@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/pion/interceptor"
+	"github.com/pion/interceptor/internal/cc"
 	"github.com/pion/interceptor/internal/rtpbuffer"
 	"github.com/pion/interceptor/internal/validation"
 	"github.com/pion/logging"
@@ -81,6 +82,7 @@ type localStream struct {
 	// resend, assigned when the resend is written (RFC 4588), so a packet
 	// resent twice goes out as two RTX packets.
 	rtxSSRC      uint32
+	rtxPT        uint8
 	rtxSequencer rtp.Sequencer
 	// resends tracks each buffered packet's resends (guarded by
 	// rtpBufferMutex); an entry is dropped when a new packet takes its
@@ -145,6 +147,7 @@ func (n *ResponderInterceptor) BindLocalStream(
 	}
 	if info.SSRCRetransmission != 0 && info.PayloadTypeRetransmission != 0 {
 		stream.rtxSSRC = info.SSRCRetransmission
+		stream.rtxPT = info.PayloadTypeRetransmission
 		stream.rtxSequencer = rtp.NewRandomSequencer()
 	}
 	n.streamsMu.Lock()
@@ -255,16 +258,20 @@ func (n *ResponderInterceptor) resendPackets(nack *rtcp.TransportLayerNack) {
 	}
 }
 
-// probeDepth bounds how far back Probe reaches into a stream's buffer.
-const probeDepth = 32
+// probePaddingSize is a probe packet's padding: the most one RTP padding
+// count can say.
+const probePaddingSize = 255
 
-// Probe resends the newest buffered packets of the stream whose media
-// SSRC is ssrc, as fresh RTX packets, until at least bytes payload bytes
-// are written or probeDepth packets are tried, and returns the bytes
-// written. The copies are bandwidth probes (libwebrtc and LiveKit probe
-// with RTX copies and padding): a receiver counts them for transport-cc
-// and drops them as duplicates of packets it has. A stream without RTX
-// is not probed (a copy on the media SSRC would be a replay).
+// Probe sends padding-only RTX packets for the stream whose media SSRC is
+// ssrc until at least bytes bytes are on their way, and returns the bytes
+// sent (RTP header + padding). They are bandwidth probes — libwebrtc and
+// LiveKit probe the same way — that a receiver counts for transport-cc
+// and discards (an RTX packet without a payload repairs nothing). Copies
+// of media were tried first and overtook their own originals still queued
+// in the pacer: the receiver filed the copy, dropped the original as a
+// duplicate before transport-cc and reported it lost. The packets carry
+// the probe attribute, so the pacer sends them outside its budget. A
+// stream without RTX is not probed.
 func (n *ResponderInterceptor) Probe(ssrc uint32, bytes int) int {
 	n.streamsMu.Lock()
 	stream, ok := n.streams[ssrc]
@@ -272,36 +279,36 @@ func (n *ResponderInterceptor) Probe(ssrc uint32, bytes int) int {
 	if !ok || stream.rtxSSRC == 0 || bytes <= 0 {
 		return 0
 	}
-	written := 0
 	stream.rtpBufferMutex.Lock()
+	var timestamp uint32
 	highest, started := stream.rtpBuffer.Highest()
+	if started {
+		if p := stream.rtpBuffer.Get(highest); p != nil {
+			timestamp = p.Header().Timestamp
+			p.Release()
+		}
+	}
 	stream.rtpBufferMutex.Unlock()
 	if !started {
 		return 0
 	}
-	for k := uint16(0); k < probeDepth && written < bytes; k++ {
+	sent := 0
+	for sent < bytes {
 		stream.rtpBufferMutex.Lock()
-		p := stream.rtpBuffer.Get(highest - k)
-		if p == nil {
-			stream.rtpBufferMutex.Unlock()
-
-			continue
-		}
-		header := p.Header()
-		if header.SSRC != stream.rtxSSRC {
-			stream.rtpBufferMutex.Unlock()
-			p.Release()
-
-			continue
-		}
-		clone := header.Clone()
-		clone.SequenceNumber = stream.rtxSequencer.NextSequenceNumber()
+		seq := stream.rtxSequencer.NextSequenceNumber()
 		stream.rtpBufferMutex.Unlock()
-		if _, err := stream.rtpWriter.Write(&clone, p.Payload(), interceptor.Attributes{}); err == nil {
-			written += len(p.Payload())
+		header := &rtp.Header{
+			Version: 2, Padding: true, PaddingSize: probePaddingSize,
+			PayloadType: stream.rtxPT, SequenceNumber: seq, Timestamp: timestamp, SSRC: stream.rtxSSRC,
 		}
-		p.Release()
+		attrs := interceptor.Attributes{}
+		attrs.Set(cc.ProbePacketAttributesKey, true)
+		n, err := stream.rtpWriter.Write(header, nil, attrs)
+		if err != nil {
+			break
+		}
+		sent += max(n, header.MarshalSize()+probePaddingSize)
 	}
 
-	return written
+	return sent
 }

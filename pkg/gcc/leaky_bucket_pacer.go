@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/pion/interceptor"
+	"github.com/pion/interceptor/internal/cc"
 	"github.com/pion/logging"
 	"github.com/pion/rtp"
 )
@@ -35,6 +36,9 @@ const (
 	PacerPriorityRetransmission                      // RTX before new media
 	PacerPriorityVideo                               // default
 	pacerPriorities
+	// pacerProbeLane is the queue of probe packets (the probe attribute):
+	// sent every tick, outside the budget.
+	pacerProbeLane = pacerPriorities
 )
 
 // PriorityPacer is a Pacer that orders its queue by stream priority.
@@ -54,7 +58,7 @@ type LeakyBucketPacer struct {
 	pacingInterval time.Duration
 
 	qLock  sync.RWMutex
-	queues [pacerPriorities]*list.List // drained in priority order
+	queues [pacerPriorities + 1]*list.List // drained in priority order; the last is the probe lane
 	done   chan struct{}
 
 	ssrcToWriter   map[uint32]interceptor.RTPWriter
@@ -147,6 +151,9 @@ func (p *LeakyBucketPacer) Write(header *rtp.Header, payload []byte, attributes 
 	if !known {
 		priority = PacerPriorityVideo
 	}
+	if probe, _ := attributes.Get(cc.ProbePacketAttributesKey).(bool); probe {
+		priority = pacerProbeLane
+	}
 	p.qLock.Lock()
 	p.queues[priority].PushBack(&item{
 		header:     &hdr,
@@ -170,6 +177,7 @@ func (p *LeakyBucketPacer) Run() {
 		case <-p.done:
 			return
 		case now := <-ticker.C:
+			p.drainProbes()
 			budget := int(float64(now.Sub(lastSent).Milliseconds()) * float64(p.getTargetBitrate()) / 8000.0)
 			p.qLock.Lock()
 			for budget > 0 {
@@ -212,10 +220,37 @@ func (p *LeakyBucketPacer) Run() {
 	}
 }
 
+// drainProbes sends every queued probe packet, outside the budget.
+func (p *LeakyBucketPacer) drainProbes() {
+	for {
+		p.qLock.Lock()
+		lane := p.queues[pacerProbeLane]
+		if lane.Len() == 0 {
+			p.qLock.Unlock()
+
+			return
+		}
+		next, ok := lane.Remove(lane.Front()).(*item)
+		p.qLock.Unlock()
+		if !ok {
+			continue
+		}
+		p.writerLock.RLock()
+		writer, ok := p.ssrcToWriter[next.header.SSRC]
+		p.writerLock.RUnlock()
+		if ok {
+			if _, err := writer.Write(next.header, (*next.payload)[:next.size], next.attributes); err != nil {
+				p.log.Errorf("failed to write probe packet: %v", err)
+			}
+		}
+		p.pool.Put(next.payload)
+	}
+}
+
 // frontQueue is the highest-priority queue with a packet waiting, or nil.
 // Caller holds qLock.
 func (p *LeakyBucketPacer) frontQueue() *list.List {
-	for _, q := range p.queues {
+	for _, q := range p.queues[:pacerPriorities] {
 		if q.Len() != 0 {
 			return q
 		}

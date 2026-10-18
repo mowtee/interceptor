@@ -19,6 +19,13 @@ import (
 // so we don't need to reparse.
 const TwccExtensionAttributesKey = iota
 
+// ProbePacketAttributesKey marks a bandwidth-probe packet (padding the
+// NACK responder sends for a probe cluster): the pacer sends it at once,
+// outside its budget — the probe's own slices set its rate, and a probe
+// held to the pacing rate (1.5 × the target) could never measure above
+// it.
+const ProbePacketAttributesKey = "pion-interceptor/probe-packet"
+
 var (
 	errMissingTWCCExtension = errors.New("missing transport layer cc header extension")
 	errInvalidFeedback      = errors.New("invalid feedback")
