@@ -265,7 +265,7 @@ func TestSendSideBWE_NumbersPacketsAtDeparture(t *testing.T) {
 		if n >= 6 {
 			break
 		}
-		require.Less(t, time.Now(), deadline, "the pacer did not drain: %v", order)
+		require.Less(t, time.Now(), deadline, "the pacer did not drain: %d packets", n)
 		time.Sleep(10 * time.Millisecond)
 	}
 	mu.Lock()

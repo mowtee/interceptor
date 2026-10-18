@@ -81,6 +81,11 @@ func (r *RTPBuffer) Clear() {
 	r.started = false
 }
 
+// Highest returns the highest sequence number added, and whether any was.
+func (r *RTPBuffer) Highest() (uint16, bool) {
+	return r.highestAdded, r.started
+}
+
 // Get returns the RetainablePacket for the requested sequence number.
 func (r *RTPBuffer) Get(seq uint16) *RetainablePacket {
 	diff := r.highestAdded - seq

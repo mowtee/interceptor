@@ -55,6 +55,11 @@ type SendSideBWE struct {
 	// twccSeq numbers packets at departure (see AddStream).
 	twccSeq atomic.Uint32
 
+	// probe is the running or last probe cluster (StartProbe).
+	probeMu     sync.Mutex
+	probe       *probeCluster
+	nextProbeID int
+
 	lock          sync.Mutex
 	latestStats   Stats
 	latestBitrate int
@@ -181,6 +186,7 @@ func (e *SendSideBWE) AddStream(info *interceptor.StreamInfo, writer interceptor
 					attributes = make(interceptor.Attributes)
 				}
 				seq := uint16(e.twccSeq.Add(1) - 1) //nolint:gosec // G115
+				e.probeSent(seq, header.MarshalSize()+len(payload))
 				ext, err := (&rtp.TransportCCExtension{TransportSequence: seq}).Marshal()
 				if err != nil {
 					return 0, err
@@ -281,6 +287,7 @@ func (e *SendSideBWE) WriteRTCP(pkts []rtcp.Packet, _ interceptor.Attributes) er
 
 		e.lossController.updateLossEstimate(acks)
 		e.delayController.updateDelayEstimate(acks)
+		e.probeAcked(acks)
 	}
 
 	return nil
@@ -328,6 +335,63 @@ func (e *SendSideBWE) SetEstimate(rate int) {
 
 	if changed && callback != nil {
 		go callback(rate)
+	}
+}
+
+// StartProbe starts a probe cluster and returns its id: every packet that
+// leaves the pacer until EndProbe is counted, media and probe copies
+// alike, and its feedback judged as one (ProbeResult). A running cluster
+// is ended first.
+func (e *SendSideBWE) StartProbe() int {
+	e.probeMu.Lock()
+	defer e.probeMu.Unlock()
+	if e.probe != nil {
+		e.probe.end(time.Now())
+	}
+	e.nextProbeID++
+	e.probe = newProbeCluster(e.nextProbeID)
+
+	return e.nextProbeID
+}
+
+// EndProbe ends the running probe cluster: no more packets join it.
+func (e *SendSideBWE) EndProbe() {
+	e.probeMu.Lock()
+	defer e.probeMu.Unlock()
+	if e.probe != nil {
+		e.probe.end(time.Now())
+	}
+}
+
+// ProbeResult returns cluster id's result once it ended and its feedback
+// is in — every packet reported, or 5 × RTT (within [250 ms, 5 s]) since
+// it ended. ok is false until then, and for an id that is not the latest.
+func (e *SendSideBWE) ProbeResult(id int) (ProbeResult, bool) {
+	e.probeMu.Lock()
+	defer e.probeMu.Unlock()
+	if e.probe == nil || e.probe.id != id || !e.probe.ready(time.Now(), probeSettle(e.delayController.rtt())) {
+		return ProbeResult{}, false
+	}
+
+	return e.probe.result(), true
+}
+
+func (e *SendSideBWE) probeSent(seq uint16, size int) {
+	e.probeMu.Lock()
+	defer e.probeMu.Unlock()
+	if e.probe != nil {
+		e.probe.sent(seq, time.Now(), size)
+	}
+}
+
+func (e *SendSideBWE) probeAcked(acks []cc.Acknowledgment) {
+	e.probeMu.Lock()
+	defer e.probeMu.Unlock()
+	if e.probe == nil {
+		return
+	}
+	for _, a := range acks {
+		e.probe.acked(a.SequenceNumber, a.Arrival)
 	}
 }
 

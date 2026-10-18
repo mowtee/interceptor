@@ -82,3 +82,13 @@ func ResponderResendInterval(interval func() time.Duration) ResponderOption {
 		return nil
 	}
 }
+
+// ResponderOnNew is called with every responder the factory creates, so
+// the caller can reach it (for Probe).
+func ResponderOnNew(f func(*ResponderInterceptor)) ResponderOption {
+	return func(r *ResponderInterceptor) error {
+		r.onNew = f
+
+		return nil
+	}
+}

@@ -47,6 +47,9 @@ func (r *ResponderInterceptorFactory) NewInterceptor(_ string) (interceptor.Inte
 	if err := validation.IsPowerOfTwo(responderInterceptor.size); err != nil {
 		return nil, err
 	}
+	if responderInterceptor.onNew != nil {
+		responderInterceptor.onNew(responderInterceptor)
+	}
 
 	return responderInterceptor, nil
 }
@@ -65,6 +68,7 @@ type ResponderInterceptor struct {
 
 	maxResends     int
 	resendInterval func() time.Duration
+	onNew          func(*ResponderInterceptor)
 }
 
 type localStream struct {
@@ -249,4 +253,55 @@ func (n *ResponderInterceptor) resendPackets(nack *rtcp.TransportLayerNack) {
 			return true
 		})
 	}
+}
+
+// probeDepth bounds how far back Probe reaches into a stream's buffer.
+const probeDepth = 32
+
+// Probe resends the newest buffered packets of the stream whose media
+// SSRC is ssrc, as fresh RTX packets, until at least bytes payload bytes
+// are written or probeDepth packets are tried, and returns the bytes
+// written. The copies are bandwidth probes (libwebrtc and LiveKit probe
+// with RTX copies and padding): a receiver counts them for transport-cc
+// and drops them as duplicates of packets it has. A stream without RTX
+// is not probed (a copy on the media SSRC would be a replay).
+func (n *ResponderInterceptor) Probe(ssrc uint32, bytes int) int {
+	n.streamsMu.Lock()
+	stream, ok := n.streams[ssrc]
+	n.streamsMu.Unlock()
+	if !ok || stream.rtxSSRC == 0 || bytes <= 0 {
+		return 0
+	}
+	written := 0
+	stream.rtpBufferMutex.Lock()
+	highest, started := stream.rtpBuffer.Highest()
+	stream.rtpBufferMutex.Unlock()
+	if !started {
+		return 0
+	}
+	for k := uint16(0); k < probeDepth && written < bytes; k++ {
+		stream.rtpBufferMutex.Lock()
+		p := stream.rtpBuffer.Get(highest - k)
+		if p == nil {
+			stream.rtpBufferMutex.Unlock()
+
+			continue
+		}
+		header := p.Header()
+		if header.SSRC != stream.rtxSSRC {
+			stream.rtpBufferMutex.Unlock()
+			p.Release()
+
+			continue
+		}
+		clone := header.Clone()
+		clone.SequenceNumber = stream.rtxSequencer.NextSequenceNumber()
+		stream.rtpBufferMutex.Unlock()
+		if _, err := stream.rtpWriter.Write(&clone, p.Payload(), interceptor.Attributes{}); err == nil {
+			written += len(p.Payload())
+		}
+		p.Release()
+	}
+
+	return written
 }

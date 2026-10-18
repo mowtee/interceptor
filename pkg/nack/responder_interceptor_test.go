@@ -723,3 +723,41 @@ func TestResponderInterceptor_ResendLimits(t *testing.T) {
 		assert.Equal(t, 1, count(stream))
 	})
 }
+
+// Probe resends the newest packets as fresh RTX packets (new numbers,
+// the originals' sequence numbers in the payload) until the byte goal,
+// and only on a stream with RTX.
+func TestResponderInterceptor_Probe(t *testing.T) {
+	var got *ResponderInterceptor
+	f, err := NewResponderInterceptor(ResponderOnNew(func(r *ResponderInterceptor) { got = r }))
+	require.NoError(t, err)
+	i, err := f.NewInterceptor("")
+	require.NoError(t, err)
+	require.NotNil(t, got, "the factory hands out its responder")
+	stream := test.NewMockStream(&interceptor.StreamInfo{
+		SSRC: 1, SSRCRetransmission: 2, PayloadTypeRetransmission: 2,
+		RTCPFeedback: []interceptor.RTCPFeedback{{Type: "nack"}},
+	}, i)
+	defer func() { require.NoError(t, stream.Close()) }()
+	for seq := uint16(10); seq < 20; seq++ {
+		require.NoError(t, stream.WriteRTP(&rtp.Packet{Header: rtp.Header{SequenceNumber: seq, SSRC: 1}, Payload: make([]byte, 100)}))
+		<-stream.WrittenRTP()
+	}
+	n := got.Probe(1, 250) // 100 B payloads + 2 B of OSN each: three copies
+	assert.GreaterOrEqual(t, n, 250)
+	var originals []uint16
+	var rtxSeqs []uint16
+	for range 3 {
+		select {
+		case p := <-stream.WrittenRTP():
+			require.Equal(t, uint32(2), p.SSRC)
+			originals = append(originals, binary.BigEndian.Uint16(p.Payload))
+			rtxSeqs = append(rtxSeqs, p.SequenceNumber)
+		case <-time.After(100 * time.Millisecond):
+			require.Fail(t, "probe copy not written")
+		}
+	}
+	assert.Equal(t, []uint16{19, 18, 17}, originals, "the newest packets, newest first")
+	assert.Equal(t, rtxSeqs[0]+1, rtxSeqs[1])
+	assert.Equal(t, 0, got.Probe(99, 1000), "an unknown stream is not probed")
+}
