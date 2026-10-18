@@ -8,6 +8,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/interceptor"
@@ -50,6 +51,9 @@ type SendSideBWE struct {
 	feedbackAdapter *cc.FeedbackAdapter
 
 	onTargetBitrateChange func(bitrate int)
+
+	// twccSeq numbers packets at departure (see AddStream).
+	twccSeq atomic.Uint32
 
 	lock          sync.Mutex
 	latestStats   Stats
@@ -161,11 +165,28 @@ func (e *SendSideBWE) AddStream(info *interceptor.StreamInfo, writer interceptor
 		}
 	}
 
+	// The transport-wide sequence number is assigned here, at departure
+	// from the pacer, as libwebrtc assigns it at egress — not upstream
+	// when the packet is queued. With priority lanes packets leave out
+	// of the order they were queued in, and a number assigned before
+	// the pacer made every lower-priority packet still waiting read as
+	// lost in the receiver's feedback: audio jumping a video burst
+	// showed as 8–12 % "loss" on a clean loopback and a layer trial was
+	// reverted on it. An upstream TWCC header-extension interceptor
+	// still negotiates the extension; its number is overwritten.
 	paced := interceptor.RTPWriterFunc(
 		func(header *rtp.Header, payload []byte, attributes interceptor.Attributes) (int, error) {
 			if hdrExtID != 0 {
 				if attributes == nil {
 					attributes = make(interceptor.Attributes)
+				}
+				seq := uint16(e.twccSeq.Add(1) - 1) //nolint:gosec // G115
+				ext, err := (&rtp.TransportCCExtension{TransportSequence: seq}).Marshal()
+				if err != nil {
+					return 0, err
+				}
+				if err := header.SetExtension(hdrExtID, ext); err != nil {
+					return 0, err
 				}
 				attributes.Set(cc.TwccExtensionAttributesKey, hdrExtID)
 			}

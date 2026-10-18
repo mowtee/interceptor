@@ -6,6 +6,7 @@ package gcc
 import (
 	"fmt"
 	"math/rand"
+	"sync"
 	"testing"
 
 	"github.com/pion/interceptor"
@@ -218,4 +219,65 @@ func TestSendSideBWE_SetEstimateLiftsTheTarget(t *testing.T) {
 	require.NoError(t, bwe.Close())
 	bwe.SetEstimate(500_000)
 	assert.Equal(t, 2_000_000, bwe.GetTargetBitrate())
+}
+
+// Packets are numbered as they leave the pacer: with audio ahead of a
+// queued video burst, the departure order still carries strictly
+// increasing transport-wide numbers (a number assigned before the pacer
+// made the waiting video read as lost in the receiver's feedback).
+func TestSendSideBWE_NumbersPacketsAtDeparture(t *testing.T) {
+	pacer := NewLeakyBucketPacer(160_000) // 1.5× → one 1000 B packet per ~6 ticks
+	bwe, err := NewSendSideBWE(SendSideBWEPacer(pacer), SendSideBWEInitialBitrate(160_000))
+	require.NoError(t, err)
+	defer func() { require.NoError(t, bwe.Close()) }()
+	var mu sync.Mutex
+	type departed struct {
+		ssrc uint32
+		seq  uint16
+	}
+	var order []departed
+	record := interceptor.RTPWriterFunc(func(header *rtp.Header, payload []byte, _ interceptor.Attributes) (int, error) {
+		var ext rtp.TransportCCExtension
+		require.NoError(t, ext.Unmarshal(header.GetExtension(1)))
+		mu.Lock()
+		order = append(order, departed{header.SSRC, ext.TransportSequence})
+		mu.Unlock()
+
+		return len(payload), nil
+	})
+	exts := []interceptor.RTPHeaderExtension{{URI: transportCCURI, ID: 1}}
+	videoWriter := bwe.AddStream(&interceptor.StreamInfo{SSRC: 1, MimeType: "video/VP9", RTPHeaderExtensions: exts}, record)
+	audioWriter := bwe.AddStream(&interceptor.StreamInfo{SSRC: 2, MimeType: "audio/opus", RTPHeaderExtensions: exts}, record)
+	stamp := twcc.HeaderExtensionInterceptor{}
+	videoWriter = stamp.BindLocalStream(&interceptor.StreamInfo{SSRC: 1, RTPHeaderExtensions: exts}, videoWriter)
+	audioWriter = stamp.BindLocalStream(&interceptor.StreamInfo{SSRC: 2, RTPHeaderExtensions: exts}, audioWriter)
+	for i := 0; i < 5; i++ {
+		_, err = videoWriter.Write(&rtp.Header{SSRC: 1, SequenceNumber: uint16(i), Extensions: []rtp.Extension{}}, make([]byte, 1000), nil) //nolint:gosec
+		require.NoError(t, err)
+	}
+	_, err = audioWriter.Write(&rtp.Header{SSRC: 2, Extensions: []rtp.Extension{}}, make([]byte, 100), nil)
+	require.NoError(t, err)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		n := len(order)
+		mu.Unlock()
+		if n >= 6 {
+			break
+		}
+		require.Less(t, time.Now(), deadline, "the pacer did not drain: %v", order)
+		time.Sleep(10 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	audioAt := -1
+	for i := range order {
+		if order[i].ssrc == 2 {
+			audioAt = i
+		}
+		if i > 0 {
+			assert.Equal(t, order[i-1].seq+1, order[i].seq, "departure order numbers: %v", order)
+		}
+	}
+	assert.Less(t, audioAt, 5, "audio left before the last video: %v", order)
 }
