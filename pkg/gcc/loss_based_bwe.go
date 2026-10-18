@@ -77,6 +77,16 @@ func (e *lossBasedBandwidthEstimator) getEstimate(wantedRate int) LossStats {
 	}
 }
 
+// setBitrate applies a probe result (libwebrtc's SendSideBandwidthEstimation::
+// SetSendBitrate): the loss controller's bitrate jumps to a rate the link
+// carried without loss; its next increase waits the usual interval.
+func (e *lossBasedBandwidthEstimator) setBitrate(rate int) {
+	e.lock.Lock()
+	defer e.lock.Unlock()
+	e.bitrate = clampInt(rate, e.minBitrate, e.maxBitrate)
+	e.lastIncrease = time.Now()
+}
+
 func (e *lossBasedBandwidthEstimator) updateLossEstimate(results []cc.Acknowledgment) {
 	if len(results) == 0 {
 		return

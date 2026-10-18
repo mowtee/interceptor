@@ -186,3 +186,36 @@ func TestSendSideBWE_PacesTheRTXSSRC(t *testing.T) {
 		}
 	}
 }
+
+func TestSendSideBWE_SetEstimateLiftsTheTarget(t *testing.T) {
+	bwe, err := NewSendSideBWE(SendSideBWEInitialBitrate(400_000), SendSideBWEMaxBitrate(2_000_000))
+	require.NoError(t, err)
+	changed := make(chan int, 4)
+	bwe.OnTargetBitrateChange(func(rate int) { changed <- rate })
+
+	bwe.SetEstimate(1_100_000)
+	assert.Equal(t, 1_100_000, bwe.GetTargetBitrate())
+	assert.Equal(t, 1_100_000, bwe.GetStats()["delayTargetBitrate"])
+	assert.Equal(t, 1_100_000, bwe.GetStats()["lossTargetBitrate"])
+	select {
+	case rate := <-changed:
+		assert.Equal(t, 1_100_000, rate)
+	case <-time.After(time.Second):
+		t.Fatal("the target callback did not fire")
+	}
+	// Clamped to the configured maximum; an unchanged target fires no
+	// callback.
+	bwe.SetEstimate(5_000_000)
+	assert.Equal(t, 2_000_000, bwe.GetTargetBitrate())
+	<-changed
+	bwe.SetEstimate(2_000_000)
+	select {
+	case rate := <-changed:
+		t.Fatalf("unchanged target fired the callback with %d", rate)
+	case <-time.After(100 * time.Millisecond):
+	}
+	// A closed estimator ignores the call.
+	require.NoError(t, bwe.Close())
+	bwe.SetEstimate(500_000)
+	assert.Equal(t, 2_000_000, bwe.GetTargetBitrate())
+}

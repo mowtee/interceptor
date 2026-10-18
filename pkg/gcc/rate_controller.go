@@ -82,6 +82,19 @@ func (c *rateController) updateRTT(rtt time.Duration) {
 	c.latestRTT = rtt
 }
 
+// setEstimate applies a probe result (libwebrtc's AimdRateControl::
+// SetEstimate): a rate the link demonstrably carried replaces the target
+// at once instead of being approached at 8 %/s from below. The caller
+// measured it; the controller only clamps it. The increase limit then
+// holds the target there until the observed rate catches up (a stale,
+// lower received rate never pulls a set estimate down).
+func (c *rateController) setEstimate(rate int) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	c.target = clampInt(rate, c.minBitrate, c.maxBitrate)
+	c.lastUpdate = c.now()
+}
+
 func (c *rateController) onDelayStats(ds DelayStats) {
 	now := time.Now()
 

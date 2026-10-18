@@ -256,6 +256,43 @@ func (e *SendSideBWE) GetTargetBitrate() int {
 	return e.latestBitrate
 }
 
+// SetEstimate applies a probe result: a rate in bits per second the link
+// demonstrably carried — the caller's measurement, delivered traffic with
+// no congestion signalled, the way libwebrtc's ProbeBitrateEstimator
+// result feeds AimdRateControl::SetEstimate and
+// SendSideBandwidthEstimation::SetSendBitrate. Both controllers jump to
+// it, clamped to the configured bounds; the pacer and the target
+// callback see it at once. On its own GCC approaches a reopened link at
+// 8 %/s and never above 1.5 × what it observes, so a sender whose probes
+// are real traffic (an SFU trialling a layer) would otherwise wait the
+// controllers out after the wire already showed what it takes. A closed
+// estimator ignores the call.
+func (e *SendSideBWE) SetEstimate(rate int) {
+	e.closeLock.RLock()
+	defer e.closeLock.RUnlock()
+	if e.isClosed() {
+		return
+	}
+	rate = clampInt(rate, e.minBitrate, e.maxBitrate)
+	e.delayController.setEstimate(rate)
+	e.lossController.setBitrate(rate)
+
+	e.lock.Lock()
+	changed := rate != e.latestBitrate
+	e.latestBitrate = rate
+	e.latestStats.DelayStats.TargetBitrate = rate
+	e.latestStats.LossStats.TargetBitrate = rate
+	if changed {
+		e.pacer.SetTargetBitrate(rate)
+	}
+	callback := e.onTargetBitrateChange
+	e.lock.Unlock()
+
+	if changed && callback != nil {
+		go callback(rate)
+	}
+}
+
 // GetStats returns some internal statistics of the bandwidth estimator.
 func (e *SendSideBWE) GetStats() map[string]any {
 	e.lock.Lock()

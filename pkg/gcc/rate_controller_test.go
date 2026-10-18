@@ -96,3 +96,21 @@ func TestRateControllerIncreaseIsLimitedByTheReceivedRate(t *testing.T) {
 	assert.Equal(t, 1_100_000, c.limitIncrease(1_050_000))
 	assert.Equal(t, 1_100_000, c.limitIncrease(1_188_000), "already above the limit: held")
 }
+
+func TestRateControllerSetEstimateReplacesTheTarget(t *testing.T) {
+	c := &rateController{
+		now: time.Now, target: 400_000, latestReceivedRate: 400_000, minBitrate: 100_000, maxBitrate: 2_000_000,
+		lastUpdate: time.Now(), latestDecreaseRate: &exponentialMovingAverage{},
+	}
+	c.setEstimate(1_100_000)
+	assert.Equal(t, 1_100_000, c.target)
+	// The stale received rate's limit (610 kbps) is below the set
+	// estimate: increases hold the target, they never lower it.
+	assert.Equal(t, 1_100_000, c.limitIncrease(1_188_000))
+	assert.Equal(t, 1_100_000, c.increase(time.Now().Add(time.Second)))
+	// Clamped to the configured bounds.
+	c.setEstimate(5_000_000)
+	assert.Equal(t, 2_000_000, c.target)
+	c.setEstimate(10)
+	assert.Equal(t, 100_000, c.target)
+}
