@@ -281,3 +281,14 @@ func TestSendSideBWE_NumbersPacketsAtDeparture(t *testing.T) {
 	}
 	assert.Less(t, audioAt, 5, "audio left before the last video: %v", order)
 }
+
+// A fresh estimator reports "normal" usage and the increase state until
+// feedback says otherwise: the zero values are the benign ones.
+func TestSendSideBWE_FreshStatsAreBenign(t *testing.T) {
+	bwe, err := NewSendSideBWE()
+	require.NoError(t, err)
+	defer func() { require.NoError(t, bwe.Close()) }()
+	st := bwe.GetStats()
+	assert.Equal(t, "normal", st["usage"])
+	assert.Equal(t, "increase", st["state"])
+}
