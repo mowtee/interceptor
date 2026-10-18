@@ -5,6 +5,7 @@ package nack
 
 import (
 	"sync"
+	"time"
 
 	"github.com/pion/interceptor"
 	"github.com/pion/interceptor/internal/rtpbuffer"
@@ -61,12 +62,31 @@ type ResponderInterceptor struct {
 
 	streams   map[uint32]*localStream
 	streamsMu sync.Mutex
+
+	maxResends     int
+	resendInterval func() time.Duration
 }
 
 type localStream struct {
 	rtpBuffer      *rtpbuffer.RTPBuffer
 	rtpBufferMutex sync.RWMutex
 	rtpWriter      interceptor.RTPWriter
+
+	// rtxSSRC is the stream's retransmission SSRC (0 without RTX) and
+	// rtxSequencer numbers the packets sent on it: one number per
+	// resend, assigned when the resend is written (RFC 4588), so a packet
+	// resent twice goes out as two RTX packets.
+	rtxSSRC      uint32
+	rtxSequencer rtp.Sequencer
+	// resends tracks each buffered packet's resends (guarded by
+	// rtpBufferMutex); an entry is dropped when a new packet takes its
+	// sequence number.
+	resends map[uint16]resendState
+}
+
+type resendState struct {
+	count int
+	last  time.Time
 }
 
 // NewResponderInterceptor returns a new ResponderInterceptorFactor.
@@ -117,6 +137,11 @@ func (n *ResponderInterceptor) BindLocalStream(
 	stream := &localStream{
 		rtpBuffer: rtpBuffer,
 		rtpWriter: writer,
+		resends:   map[uint16]resendState{},
+	}
+	if info.SSRCRetransmission != 0 && info.PayloadTypeRetransmission != 0 {
+		stream.rtxSSRC = info.SSRCRetransmission
+		stream.rtxSequencer = rtp.NewRandomSequencer()
 	}
 	n.streamsMu.Lock()
 	n.streams[info.SSRC] = stream
@@ -136,6 +161,7 @@ func (n *ResponderInterceptor) BindLocalStream(
 
 			stream.rtpBufferMutex.Lock()
 			stream.rtpBuffer.Add(pkt)
+			delete(stream.resends, header.SequenceNumber)
 			stream.rtpBufferMutex.Unlock()
 
 			return writer.Write(header, payload, attributes)
@@ -181,20 +207,44 @@ func (n *ResponderInterceptor) resendPackets(nack *rtcp.TransportLayerNack) {
 		return
 	}
 
+	var interval time.Duration
+	if n.resendInterval != nil {
+		interval = n.resendInterval()
+	}
 	for i := range nack.Nacks {
 		nack.Nacks[i].Range(func(seq uint16) bool {
-			// save the packet under the buffer lock
+			// get the packet under the buffer lock, and decide and number
+			// the resend there too (NACKs are handled concurrently)
 			stream.rtpBufferMutex.Lock()
 			p := stream.rtpBuffer.Get(seq)
+			if p == nil {
+				stream.rtpBufferMutex.Unlock()
+
+				return true
+			}
+			now := time.Now()
+			st := stream.resends[seq]
+			if (n.maxResends > 0 && st.count >= n.maxResends) ||
+				(interval > 0 && st.count > 0 && now.Sub(st.last) < interval) {
+				stream.rtpBufferMutex.Unlock()
+				p.Release()
+
+				return true
+			}
+			stream.resends[seq] = resendState{count: st.count + 1, last: now}
+			header := p.Header()
+			if stream.rtxSSRC != 0 && header.SSRC == stream.rtxSSRC {
+				clone := header.Clone()
+				clone.SequenceNumber = stream.rtxSequencer.NextSequenceNumber()
+				header = &clone
+			}
 			stream.rtpBufferMutex.Unlock()
 
-			if p != nil {
-				// send without holding rtpBufferMutex
-				if _, err := stream.rtpWriter.Write(p.Header(), p.Payload(), interceptor.Attributes{}); err != nil {
-					n.log.Warnf("failed resending nacked packet: %+v", err)
-				}
-				p.Release()
+			// send without holding rtpBufferMutex
+			if _, err := stream.rtpWriter.Write(header, p.Payload(), interceptor.Attributes{}); err != nil {
+				n.log.Warnf("failed resending nacked packet: %+v", err)
 			}
+			p.Release()
 
 			return true
 		})

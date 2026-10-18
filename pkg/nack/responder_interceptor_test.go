@@ -619,3 +619,107 @@ func TestResponderInterceptor_NoDeadlockWithReentrantRTPWriter(t *testing.T) {
 		assert.Fail(t, "ResponderInterceptor.Write deadlocked with reentrant RTP writer")
 	}
 }
+
+// Every resend of a packet is a new RTX packet: RFC 4588 gives the
+// retransmission stream its own sequence numbers, one per packet sent on
+// it. A resend that reused the number of an earlier resend of the same
+// packet is a replay to the receiver — SRTP replay protection or a
+// duplicate check drops it, its transport-wide number is never reported
+// received, and the sender's loss controller counts a loss that never
+// happened.
+func TestResponderInterceptor_RTXSequenceNumberPerResend(t *testing.T) {
+	f, err := NewResponderInterceptor()
+	require.NoError(t, err)
+	i, err := f.NewInterceptor("")
+	require.NoError(t, err)
+	stream := test.NewMockStream(&interceptor.StreamInfo{
+		SSRC: 1, SSRCRetransmission: 2, PayloadTypeRetransmission: 2,
+		RTCPFeedback: []interceptor.RTCPFeedback{{Type: "nack"}},
+	}, i)
+	defer func() { require.NoError(t, stream.Close()) }()
+
+	require.NoError(t, stream.WriteRTP(&rtp.Packet{Header: rtp.Header{SequenceNumber: 10, SSRC: 1}}))
+	<-stream.WrittenRTP()
+
+	var rtxSeqs []uint16
+	for range 2 {
+		stream.ReceiveRTCP([]rtcp.Packet{&rtcp.TransportLayerNack{
+			MediaSSRC: 1, SenderSSRC: 2, Nacks: []rtcp.NackPair{{PacketID: 10}},
+		}})
+		select {
+		case p := <-stream.WrittenRTP():
+			require.Equal(t, uint32(2), p.SSRC)
+			require.Equal(t, uint16(10), binary.BigEndian.Uint16(p.Payload))
+			rtxSeqs = append(rtxSeqs, p.SequenceNumber)
+		case <-time.After(100 * time.Millisecond):
+			require.Fail(t, "resend not written")
+		}
+	}
+	assert.Equal(t, rtxSeqs[0]+1, rtxSeqs[1], "each resend takes the next RTX sequence number: %v", rtxSeqs)
+}
+
+// ResponderMaxResends caps the resends of one packet; ResponderResendInterval
+// keeps repeated NACKs for one packet from resending it again too soon.
+func TestResponderInterceptor_ResendLimits(t *testing.T) {
+	nackFor := func(stream *test.MockStream, seq uint16) {
+		stream.ReceiveRTCP([]rtcp.Packet{&rtcp.TransportLayerNack{
+			MediaSSRC: 1, SenderSSRC: 2, Nacks: []rtcp.NackPair{{PacketID: seq}},
+		}})
+	}
+	count := func(stream *test.MockStream) int {
+		n := 0
+		for {
+			select {
+			case <-stream.WrittenRTP():
+				n++
+			case <-time.After(50 * time.Millisecond):
+				return n
+			}
+		}
+	}
+	newStream := func(opts ...ResponderOption) *test.MockStream {
+		f, err := NewResponderInterceptor(opts...)
+		require.NoError(t, err)
+		i, err := f.NewInterceptor("")
+		require.NoError(t, err)
+		stream := test.NewMockStream(&interceptor.StreamInfo{
+			SSRC: 1, SSRCRetransmission: 2, PayloadTypeRetransmission: 2,
+			RTCPFeedback: []interceptor.RTCPFeedback{{Type: "nack"}},
+		}, i)
+		require.NoError(t, stream.WriteRTP(&rtp.Packet{Header: rtp.Header{SequenceNumber: 10, SSRC: 1}}))
+		<-stream.WrittenRTP()
+
+		return stream
+	}
+
+	t.Run("max resends", func(t *testing.T) {
+		stream := newStream(ResponderMaxResends(3))
+		defer func() { require.NoError(t, stream.Close()) }()
+		for range 5 {
+			nackFor(stream, 10)
+			time.Sleep(5 * time.Millisecond)
+		}
+		assert.Equal(t, 3, count(stream))
+	})
+	t.Run("interval", func(t *testing.T) {
+		stream := newStream(ResponderResendInterval(func() time.Duration { return 80 * time.Millisecond }))
+		defer func() { require.NoError(t, stream.Close()) }()
+		nackFor(stream, 10)
+		time.Sleep(5 * time.Millisecond)
+		nackFor(stream, 10)
+		assert.Equal(t, 1, count(stream), "a second NACK inside the interval resends nothing")
+		time.Sleep(60 * time.Millisecond)
+		nackFor(stream, 10)
+		assert.Equal(t, 1, count(stream), "past the interval the packet is resent again")
+	})
+	t.Run("a new packet with a reused sequence number starts afresh", func(t *testing.T) {
+		stream := newStream(ResponderMaxResends(1))
+		defer func() { require.NoError(t, stream.Close()) }()
+		nackFor(stream, 10)
+		assert.Equal(t, 1, count(stream))
+		require.NoError(t, stream.WriteRTP(&rtp.Packet{Header: rtp.Header{SequenceNumber: 10, SSRC: 1}}))
+		<-stream.WrittenRTP()
+		nackFor(stream, 10)
+		assert.Equal(t, 1, count(stream))
+	})
+}
