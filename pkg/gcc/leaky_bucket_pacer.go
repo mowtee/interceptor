@@ -23,6 +23,26 @@ type item struct {
 	attributes interceptor.Attributes
 }
 
+// PacerPriority orders a pacer's queues: lower goes first. libwebrtc's
+// pacer sends audio before retransmissions before video — a resend
+// queued behind a keyframe burst at the pacing rate (a 40 kB keyframe
+// drains in ~180 ms at 1.5 × 1.2 Mbit/s) arrives after the receiver's
+// repair window and the frame is lost anyway.
+type PacerPriority int
+
+const (
+	PacerPriorityAudio          PacerPriority = iota // first
+	PacerPriorityRetransmission                      // RTX before new media
+	PacerPriorityVideo                               // default
+	pacerPriorities
+)
+
+// PriorityPacer is a Pacer that orders its queue by stream priority.
+type PriorityPacer interface {
+	Pacer
+	AddStreamWithPriority(ssrc uint32, writer interceptor.RTPWriter, priority PacerPriority)
+}
+
 // LeakyBucketPacer implements a leaky bucket pacing algorithm.
 type LeakyBucketPacer struct {
 	log logging.LeveledLogger
@@ -33,12 +53,13 @@ type LeakyBucketPacer struct {
 
 	pacingInterval time.Duration
 
-	qLock sync.RWMutex
-	queue *list.List
-	done  chan struct{}
+	qLock  sync.RWMutex
+	queues [pacerPriorities]*list.List // drained in priority order
+	done   chan struct{}
 
-	ssrcToWriter map[uint32]interceptor.RTPWriter
-	writerLock   sync.RWMutex
+	ssrcToWriter   map[uint32]interceptor.RTPWriter
+	ssrcToPriority map[uint32]PacerPriority
+	writerLock     sync.RWMutex
 
 	pool *sync.Pool
 }
@@ -55,10 +76,13 @@ func newLeakyBucketPacer(initialBitrate int, loggerFactory logging.LoggerFactory
 		targetBitrate:  initialBitrate,
 		pacingInterval: 5 * time.Millisecond,
 		qLock:          sync.RWMutex{},
-		queue:          list.New(),
 		done:           make(chan struct{}),
 		ssrcToWriter:   map[uint32]interceptor.RTPWriter{},
+		ssrcToPriority: map[uint32]PacerPriority{},
 		pool:           &sync.Pool{},
+	}
+	for i := range pacer.queues {
+		pacer.queues[i] = list.New()
 	}
 	pacer.pool = &sync.Pool{
 		New: func() any {
@@ -73,11 +97,22 @@ func newLeakyBucketPacer(initialBitrate int, loggerFactory logging.LoggerFactory
 	return pacer
 }
 
-// AddStream adds a new stream and its corresponding writer to the pacer.
+// AddStream adds a new stream and its corresponding writer to the pacer
+// at video priority.
 func (p *LeakyBucketPacer) AddStream(ssrc uint32, writer interceptor.RTPWriter) {
+	p.AddStreamWithPriority(ssrc, writer, PacerPriorityVideo)
+}
+
+// AddStreamWithPriority adds a stream whose packets are queued at the
+// given priority.
+func (p *LeakyBucketPacer) AddStreamWithPriority(ssrc uint32, writer interceptor.RTPWriter, priority PacerPriority) {
+	if priority < 0 || priority >= pacerPriorities {
+		priority = PacerPriorityVideo
+	}
 	p.writerLock.Lock()
 	defer p.writerLock.Unlock()
 	p.ssrcToWriter[ssrc] = writer
+	p.ssrcToPriority[ssrc] = priority
 }
 
 // SetTargetBitrate updates the target bitrate at which the pacer is allowed to
@@ -106,8 +141,14 @@ func (p *LeakyBucketPacer) Write(header *rtp.Header, payload []byte, attributes 
 	copy(*buf, payload)
 	hdr := header.Clone()
 
+	p.writerLock.RLock()
+	priority, known := p.ssrcToPriority[header.SSRC]
+	p.writerLock.RUnlock()
+	if !known {
+		priority = PacerPriorityVideo
+	}
 	p.qLock.Lock()
-	p.queue.PushBack(&item{
+	p.queues[priority].PushBack(&item{
 		header:     &hdr,
 		payload:    buf,
 		size:       len(payload),
@@ -131,9 +172,13 @@ func (p *LeakyBucketPacer) Run() {
 		case now := <-ticker.C:
 			budget := int(float64(now.Sub(lastSent).Milliseconds()) * float64(p.getTargetBitrate()) / 8000.0)
 			p.qLock.Lock()
-			for p.queue.Len() != 0 && budget > 0 {
-				p.log.Infof("budget=%v, len(queue)=%v, targetBitrate=%v", budget, p.queue.Len(), p.getTargetBitrate())
-				next, ok := p.queue.Remove(p.queue.Front()).(*item)
+			for budget > 0 {
+				queue := p.frontQueue()
+				if queue == nil {
+					break
+				}
+				p.log.Infof("budget=%v, len(queue)=%v, targetBitrate=%v", budget, p.queued(), p.getTargetBitrate())
+				next, ok := queue.Remove(queue.Front()).(*item)
 				p.qLock.Unlock()
 				if !ok {
 					p.log.Warnf("failed to access leaky bucket pacer queue, cast failed")
@@ -165,6 +210,29 @@ func (p *LeakyBucketPacer) Run() {
 			p.qLock.Unlock()
 		}
 	}
+}
+
+// frontQueue is the highest-priority queue with a packet waiting, or nil.
+// Caller holds qLock.
+func (p *LeakyBucketPacer) frontQueue() *list.List {
+	for _, q := range p.queues {
+		if q.Len() != 0 {
+			return q
+		}
+	}
+
+	return nil
+}
+
+// queued is the number of packets waiting across all priorities. Caller
+// holds qLock.
+func (p *LeakyBucketPacer) queued() int {
+	n := 0
+	for _, q := range p.queues {
+		n += q.Len()
+	}
+
+	return n
 }
 
 // Close closes the LeakyBucketPacer.

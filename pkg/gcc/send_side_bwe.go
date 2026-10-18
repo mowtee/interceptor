@@ -6,6 +6,7 @@ package gcc
 import (
 	"errors"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -175,7 +176,14 @@ func (e *SendSideBWE) AddStream(info *interceptor.StreamInfo, writer interceptor
 			return writer.Write(header, payload, attributes)
 		},
 	)
-	e.pacer.AddStream(info.SSRC, paced)
+	// Audio goes first, retransmissions before new video, as in
+	// libwebrtc's pacer — a pacer that orders by priority is asked to;
+	// any other Pacer gets a single queue.
+	priority := PacerPriorityVideo
+	if strings.HasPrefix(strings.ToLower(info.MimeType), "audio/") {
+		priority = PacerPriorityAudio
+	}
+	e.addPacedStream(info.SSRC, paced, priority)
 	// The stream's RTX SSRC is paced and stamped the same way: a NACK
 	// responder upstream of this interceptor writes its resends under it,
 	// and a pacer that knew only the media SSRC dropped them ("no writer
@@ -183,10 +191,19 @@ func (e *SendSideBWE) AddStream(info *interceptor.StreamInfo, writer interceptor
 	// resends reused the original packet's transport-wide sequence number
 	// and the feedback for a resend read as a 450 ms delay of the original.
 	if info.SSRCRetransmission != 0 {
-		e.pacer.AddStream(info.SSRCRetransmission, paced)
+		e.addPacedStream(info.SSRCRetransmission, paced, PacerPriorityRetransmission)
 	}
 
 	return e.pacer
+}
+
+func (e *SendSideBWE) addPacedStream(ssrc uint32, writer interceptor.RTPWriter, priority PacerPriority) {
+	if pp, ok := e.pacer.(PriorityPacer); ok {
+		pp.AddStreamWithPriority(ssrc, writer, priority)
+
+		return
+	}
+	e.pacer.AddStream(ssrc, writer)
 }
 
 // WriteRTCP adds some RTCP feedback to the bandwidth estimator.
