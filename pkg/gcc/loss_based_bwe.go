@@ -44,6 +44,10 @@ const (
 	// window without any loss may increase.
 	lossWindowMax = 2 * time.Second
 	lossWindowMin = 20
+
+	// lossLimitClear is how long after the last loss cut, with the window
+	// under increaseLossThreshold, the controller stops constraining.
+	lossLimitClear = 2 * time.Second
 )
 
 // lossEntry is one packet the feedback reported on.
@@ -80,6 +84,12 @@ type lossBasedBandwidthEstimator struct {
 	highest   int64
 	hasSeq    bool
 	countFrom time.Time
+
+	// lossLimited: a loss cut happened and the window has not been clean
+	// for lossLimitClear since. Only then does this controller constrain
+	// the target (libwebrtc's LossBasedBweV2 is "delay based" until loss
+	// limits it); otherwise it follows the delay controller.
+	lossLimited bool
 }
 
 func newLossBasedBWE(initialBitrate int, loggerFactory logging.LoggerFactory) *lossBasedBandwidthEstimator {
@@ -102,7 +112,12 @@ func (e *lossBasedBandwidthEstimator) getEstimate(wantedRate int) LossStats {
 	e.lock.Lock()
 	defer e.lock.Unlock()
 
-	if e.bitrate <= 0 {
+	if e.bitrate <= 0 || !e.lossLimited {
+		// Not loss limited: follow the delay controller up as well as
+		// down. Latching every dip of it (min) and climbing back at 8 %/s
+		// — and only while the window read under 2 %, a quarter of the
+		// time on a 1 %-loss link — held a third of the delay target for
+		// seconds with no loss cut at all (home lab R18).
 		e.bitrate = clampInt(wantedRate, e.minBitrate, e.maxBitrate)
 	}
 	e.bitrate = min(wantedRate, e.bitrate)
@@ -151,6 +166,10 @@ func (e *lossBasedBandwidthEstimator) updateLossEstimate(results []cc.Acknowledg
 		e.averageLoss = lossRatio
 	}
 
+	if e.lossLimited && valid && lossRatio < increaseLossThreshold && e.now().Sub(e.lastDecrease) >= lossLimitClear {
+		e.lossLimited = false
+	}
+
 	switch {
 	case (valid && lossRatio < increaseLossThreshold || !valid && !anyLost) &&
 		e.now().Sub(e.lastIncrease) > increaseTimeThreshold:
@@ -160,6 +179,7 @@ func (e *lossBasedBandwidthEstimator) updateLossEstimate(results []cc.Acknowledg
 	case valid && lossRatio > decreaseLossThreshold && e.now().Sub(e.lastDecrease) > decreaseTimeThreshold:
 		e.log.Infof("loss controller decreasing; loss: %v", lossRatio)
 		e.lastDecrease = e.now()
+		e.lossLimited = true
 		e.bitrate = clampInt(int(float64(e.bitrate)*(1-0.5*lossRatio)), e.minBitrate, e.maxBitrate)
 		// The losses that cut are spent: the next decrease needs new ones.
 		e.countFrom = e.window[len(e.window)-1].departure
