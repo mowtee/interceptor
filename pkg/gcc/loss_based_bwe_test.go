@@ -187,11 +187,11 @@ func TestLossBasedBWELateReportedPacketIsNotLost(t *testing.T) {
 // Mbit/s, loss 0.47).
 func TestLossBasedBWEFollowsTheDelayTargetUnlessLossLimited(t *testing.T) {
 	f := newLossFeed(1_000_000, 4)
-	f.run(2*time.Second, 150, 45*time.Millisecond, 0.01)
+	f.run(2*time.Second, 150, 45*time.Millisecond, 0.0)
 	if got := f.e.getEstimate(430_000).TargetBitrate; got != 430_000 {
 		t.Fatalf("a dip of the delay target applies: %d", got)
 	}
-	f.run(45*time.Millisecond, 150, 45*time.Millisecond, 0.01)
+	f.run(45*time.Millisecond, 150, 45*time.Millisecond, 0.0)
 	if got := f.e.getEstimate(1_390_000).TargetBitrate; got != 1_390_000 {
 		t.Fatalf("not loss limited: the delay target's rise applies at once, got %d", got)
 	}
@@ -210,5 +210,21 @@ func TestLossBasedBWEFollowsTheDelayTargetUnlessLossLimited(t *testing.T) {
 	f.run(4*time.Second, 150, 45*time.Millisecond, 0.0)
 	if got := f.e.getEstimate(2_000_000).TargetBitrate; got != 2_000_000 {
 		t.Fatalf("clean for 4 s: no longer loss limited, got %d", got)
+	}
+}
+
+// Between the thresholds (2–10 % loss, no cut) the controller holds: it
+// follows the delay target down, not up.
+func TestLossBasedBWEHoldsInTheLossBand(t *testing.T) {
+	f := newLossFeed(1_000_000, 6)
+	f.run(2*time.Second, 150, 45*time.Millisecond, 0.0)
+	f.wanted = 600_000
+	f.run(45*time.Millisecond, 150, 45*time.Millisecond, 0.0)
+	if got := f.e.getEstimate(600_000).TargetBitrate; got != 600_000 {
+		t.Fatalf("down with the delay target: %d", got)
+	}
+	f.run(3*time.Second, 150, 45*time.Millisecond, 0.05)
+	if got := f.e.getEstimate(1_400_000).TargetBitrate; got > 700_000 {
+		t.Fatalf("5 %% loss: no rise with the delay target, got %d", got)
 	}
 }

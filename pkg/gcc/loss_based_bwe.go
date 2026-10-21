@@ -90,6 +90,12 @@ type lossBasedBandwidthEstimator struct {
 	// the target (libwebrtc's LossBasedBweV2 is "delay based" until loss
 	// limits it); otherwise it follows the delay controller.
 	lossLimited bool
+	// follow: not loss limited and the window reads under
+	// increaseLossThreshold — the controller takes the delay target up.
+	// Between the thresholds it holds (and follows down), as before: on
+	// a 5 %-loss link following the delay controller up built a 1.1–1.3 s
+	// queue (home lab R19, `poor`).
+	follow bool
 }
 
 func newLossBasedBWE(initialBitrate int, loggerFactory logging.LoggerFactory) *lossBasedBandwidthEstimator {
@@ -112,7 +118,7 @@ func (e *lossBasedBandwidthEstimator) getEstimate(wantedRate int) LossStats {
 	e.lock.Lock()
 	defer e.lock.Unlock()
 
-	if e.bitrate <= 0 || !e.lossLimited {
+	if e.bitrate <= 0 || e.follow {
 		// Not loss limited: follow the delay controller up as well as
 		// down. Latching every dip of it (min) and climbing back at 8 %/s
 		// — and only while the window read under 2 %, a quarter of the
@@ -162,6 +168,9 @@ func (e *lossBasedBandwidthEstimator) updateLossEstimate(results []cc.Acknowledg
 
 	lossRatio, valid, anyLost := e.windowLoss()
 	e.lastLossUpdate = e.now()
+	defer func() {
+		e.follow = !e.lossLimited && (valid && lossRatio < increaseLossThreshold || !valid && !anyLost)
+	}()
 	if valid {
 		e.averageLoss = lossRatio
 	}
